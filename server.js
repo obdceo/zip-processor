@@ -5,6 +5,11 @@ import AdmZip from "adm-zip";
 const app = express();
 app.use(express.json());
 
+// ✅ ADD THIS RIGHT HERE
+app.get("/", (req, res) => {
+  res.send("Zip processor is running");
+});
+
 app.post("/process-zip", async (req, res) => {
   try {
     const { website_order_id, repo_name, zip_url } = req.body;
