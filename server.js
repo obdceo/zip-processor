@@ -51,8 +51,13 @@ app.post("/process-zip", async (req, res) => {
 
     res.json({ ok: true });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false });
+    const message = err?.stack || err?.message || String(err);
+    console.error("ZIP processor error:", message);
+
+    res.status(500).json({
+      ok: false,
+      error: message
+    });
   }
 });
 
