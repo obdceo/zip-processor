@@ -163,12 +163,16 @@ app.post("/process-zip", async (req, res) => {
       console.log("Uploaded:", filePath);
     }
 
-    await updateWebsiteOrder(website_order_id, {
-      github_push_status: "pushed",
-      github_pushed_at: new Date().toISOString(),
-    });
+    try {
+  await updateWebsiteOrder(website_order_id, {
+    github_push_status: "pushed",
+    github_pushed_at: new Date().toISOString(),
+  });
 
-    console.log("WP updated: pushed");
+  console.log("WP updated: pushed");
+} catch (wpErr) {
+  console.error("WP update failed:", wpErr.message);
+}
 
     return res.status(200).json({
       ok: true,
@@ -198,6 +202,6 @@ app.post("/process-zip", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Zip processor running on port ${PORT}`);
 });
