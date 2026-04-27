@@ -2,6 +2,10 @@ import express from "express";
 import fetch from "node-fetch";
 import AdmZip from "adm-zip";
 
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
+
 const app = express();
 app.use(express.json());
 
