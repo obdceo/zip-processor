@@ -2,14 +2,14 @@ import express from "express";
 import fetch from "node-fetch";
 import AdmZip from "adm-zip";
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
-});
-
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
 
 app.get("/", (req, res) => {
   res.send("Zip processor is running");
