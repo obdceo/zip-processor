@@ -2,6 +2,8 @@ import express from "express";
 import fetch from "node-fetch";
 import AdmZip from "adm-zip";
 
+console.log("ZIP PROCESSOR BUILD v4");
+
 const app = express();
 app.use(express.json());
 
