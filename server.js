@@ -26,6 +26,13 @@ function githubHeaders() {
   };
 }
 
+function cloudflareHeaders() {
+  return {
+    Authorization: `Bearer ${process.env.CF_API_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+}
+
 function wpAuthHeader() {
   const raw = `${process.env.WP_USERNAME}:${process.env.WP_APP_PASSWORD}`;
   return {
@@ -93,6 +100,49 @@ function normalizeFilePath(entryName, rootPrefix) {
   return filePath.replace(/^\/+/, "");
 }
 
+function detectFramework(files) {
+  const filePaths = files.map((f) => f.filePath);
+
+  const hasPackageJson = filePaths.includes("package.json");
+  const hasIndexHtml = filePaths.includes("index.html");
+  const hasAstroConfig = filePaths.some((p) =>
+    p.startsWith("astro.config")
+  );
+  const hasNextConfig = filePaths.some((p) =>
+    p.startsWith("next.config")
+  );
+
+  if (!hasPackageJson && hasIndexHtml) {
+    return {
+      framework: "static",
+      build_command: null,
+      output_dir: "/",
+    };
+  }
+
+  if (hasAstroConfig) {
+    return {
+      framework: "astro",
+      build_command: "npm run build",
+      output_dir: "dist",
+    };
+  }
+
+  if (hasNextConfig) {
+    return {
+      framework: "next-static",
+      build_command: "npm run build && npm run export",
+      output_dir: "out",
+    };
+  }
+
+  return {
+    framework: "vite",
+    build_command: "npm run build",
+    output_dir: "dist",
+  };
+}
+
 async function uploadFileToGitHub({ owner, repoName, filePath, content }) {
   const safePath = encodeURIComponent(filePath).replace(/%2F/g, "/");
 
@@ -113,6 +163,45 @@ async function uploadFileToGitHub({ owner, repoName, filePath, content }) {
   if (!res.ok) {
     throw new Error(`GitHub upload failed for ${filePath}: ${res.status} ${text}`);
   }
+}
+
+async function createCloudflarePagesProject({
+  repoName,
+  productionBranch,
+  buildCommand,
+  outputDir,
+}) {
+  const res = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/pages/projects`,
+    {
+      method: "POST",
+      headers: cloudflareHeaders(),
+      body: JSON.stringify({
+        name: repoName,
+        production_branch: productionBranch,
+        build_config: {
+          build_command: buildCommand,
+          destination_dir: outputDir,
+        },
+        source: {
+          type: "github",
+          config: {
+            owner: process.env.GITHUB_USERNAME,
+            repo_name: repoName,
+            production_branch: productionBranch,
+          },
+        },
+      }),
+    }
+  );
+
+  const json = await res.json();
+
+  if (!res.ok) {
+    throw new Error(`Cloudflare Pages create failed: ${JSON.stringify(json)}`);
+  }
+
+  return json.result;
 }
 
 app.post("/process-zip", async (req, res) => {
@@ -159,53 +248,73 @@ app.post("/process-zip", async (req, res) => {
     console.log(`Uploading ${files.length} files to GitHub repo: ${repo_name}`);
 
     for (const { entry, filePath } of files) {
-      await uploadFileToGitHub({
-        owner: process.env.GITHUB_USERNAME,
-        repoName: repo_name,
-        filePath,
-        content: entry.getData(),
-      });
+  await uploadFileToGitHub({
+    owner: process.env.GITHUB_USERNAME,
+    repoName: repo_name,
+    filePath,
+    content: entry.getData(),
+  });
 
-      console.log("Uploaded:", filePath);
-    }
+  console.log("Uploaded:", filePath);
+}
 
-    try {
+const buildConfig = detectFramework(files);
+
+console.log("Detected framework:", buildConfig.framework);
+
+const pagesProject = await createCloudflarePagesProject({
+  repoName: repo_name,
+  productionBranch: "main",
+  buildCommand: buildConfig.build_command,
+  outputDir: buildConfig.output_dir,
+});
+
+const previewUrl = `https://${pagesProject.subdomain}`;
+
+try {
   await updateWebsiteOrder(website_order_id, {
     github_push_status: "pushed",
     github_pushed_at: new Date().toISOString(),
+    deployment_provider: "cloudflare_pages",
+    deployment_status: "deployed",
+    deployed_preview_url: previewUrl,
+    cloudflare_project_name: pagesProject.name,
   });
 
-  console.log("WP updated: pushed");
+  console.log("WP updated: pushed and deployed");
 } catch (wpErr) {
   console.error("WP update failed:", wpErr.message);
 }
 
-    return res.status(200).json({
-      ok: true,
-      website_order_id,
-      repo_name,
-      uploaded_files: files.length,
-      status: "pushed",
-    });
-  } catch (err) {
-    const message = err?.stack || err?.message || String(err);
-    console.error("ZIP processor error:", message);
+return res.status(200).json({
+  ok: true,
+  website_order_id,
+  repo_name,
+  uploaded_files: files.length,
+  status: "deployed",
+  framework: buildConfig.framework,
+  deployed_preview_url: previewUrl,
+});
+} catch (err) {
+  const message = err?.stack || err?.message || String(err);
+  console.error("ZIP processor error:", message);
 
-    try {
-      if (website_order_id) {
-        await updateWebsiteOrder(website_order_id, {
-          github_push_status: "failed",
-        });
-      }
-    } catch (wpErr) {
-      console.error("Failed to update WP after error:", wpErr?.message || String(wpErr));
+  try {
+    if (website_order_id) {
+      await updateWebsiteOrder(website_order_id, {
+        github_push_status: "failed",
+        deployment_status: "failed",
+      });
     }
-
-    return res.status(500).json({
-      ok: false,
-      error: message,
-    });
+  } catch (wpErr) {
+    console.error("Failed to update WP after error:", wpErr?.message || String(wpErr));
   }
+
+  return res.status(500).json({
+    ok: false,
+    error: message,
+  });
+}
 });
 
 app.listen(PORT, "0.0.0.0", () => {
