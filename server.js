@@ -194,8 +194,8 @@ function detectFramework(files) {
 
   return {
     framework: "vite",
-    build_command: "npm run build",
-    output_dir: "dist",
+    build_command: "pnpm install && pnpm run build",
+    output_dir: "dist/public",
   };
 }
 
@@ -316,6 +316,15 @@ app.post("/process-zip", async (req, res) => {
 
   console.log("Uploaded:", filePath);
 }
+
+await uploadFileToGitHub({
+  owner: process.env.GITHUB_USERNAME,
+  repoName: repo_name,
+  filePath: ".npmrc",
+  content: Buffer.from("legacy-peer-deps=true\n", "utf8"),
+});
+
+console.log("Uploaded: .npmrc");
 
 const buildConfig = detectFramework(files);
 
