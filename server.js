@@ -76,6 +76,62 @@ function shouldSkipFile(filePath) {
   );
 }
 
+function isTextFileForImageRewrite(filePath) {
+  return (
+    filePath.endsWith(".tsx") ||
+    filePath.endsWith(".ts") ||
+    filePath.endsWith(".jsx") ||
+    filePath.endsWith(".js") ||
+    filePath.endsWith(".html") ||
+    filePath.endsWith(".css")
+  );
+}
+
+function getReplacementImageUrl(originalPath) {
+  const lower = originalPath.toLowerCase();
+
+  if (lower.includes("coworking")) {
+    return "https://images.unsplash.com/photo-1497366754035-f200968a6e72?auto=format&fit=crop&w=1600&q=80";
+  }
+
+  if (lower.includes("office") || lower.includes("workspace")) {
+    return "https://images.unsplash.com/photo-1497366811353-6870744d04b2?auto=format&fit=crop&w=1600&q=80";
+  }
+
+  if (lower.includes("conference") || lower.includes("meeting")) {
+    return "https://images.unsplash.com/photo-1517502884422-41eaead166d4?auto=format&fit=crop&w=1600&q=80";
+  }
+
+  if (lower.includes("sustain") || lower.includes("green") || lower.includes("eco")) {
+    return "https://images.unsplash.com/photo-1497215728101-856f4ea42174?auto=format&fit=crop&w=1600&q=80";
+  }
+
+  if (lower.includes("team") || lower.includes("people")) {
+    return "https://images.unsplash.com/photo-1519389950473-47ba0277781c?auto=format&fit=crop&w=1600&q=80";
+  }
+
+  return "https://images.unsplash.com/photo-1497366754035-f200968a6e72?auto=format&fit=crop&w=1600&q=80";
+}
+
+function rewriteManusStorageImagePaths(content, filePath) {
+  if (!isTextFileForImageRewrite(filePath)) {
+    return content;
+  }
+
+  let text = content.toString("utf8");
+
+  text = text.replace(
+    /\/manus-storage\/[^"'`)\s]+?\.(jpg|jpeg|png|webp|gif)/gi,
+    (match) => {
+      const replacement = getReplacementImageUrl(match);
+      console.log(`Rewrote image path in ${filePath}: ${match} -> ${replacement}`);
+      return replacement;
+    }
+  );
+
+  return Buffer.from(text, "utf8");
+}
+
 function findProjectRootPrefix(entries) {
   const fileNames = entries
     .filter((entry) => !entry.isDirectory)
@@ -248,11 +304,14 @@ app.post("/process-zip", async (req, res) => {
     console.log(`Uploading ${files.length} files to GitHub repo: ${repo_name}`);
 
     for (const { entry, filePath } of files) {
+  const originalContent = entry.getData();
+  const uploadContent = rewriteManusStorageImagePaths(originalContent, filePath);
+
   await uploadFileToGitHub({
     owner: process.env.GITHUB_USERNAME,
     repoName: repo_name,
     filePath,
-    content: entry.getData(),
+    content: uploadContent,
   });
 
   console.log("Uploaded:", filePath);
