@@ -417,7 +417,17 @@ await ensureGitHubRepo(repo_name);
 
     for (const { entry, filePath } of files) {
   const originalContent = entry.getData();
-  const uploadContent = rewriteManusStorageImagePaths(originalContent, filePath);
+
+const hasLocalImages = files.some(({ filePath }) =>
+  filePath.startsWith("client/public/images/") ||
+  filePath.startsWith("public/images/")
+);
+
+console.log("Local images detected:", hasLocalImages);
+
+const uploadContent = hasLocalImages
+  ? originalContent
+  : rewriteManusStorageImagePaths(originalContent, filePath);
 
   await uploadFileToGitHub({
     owner: process.env.GITHUB_USERNAME,
