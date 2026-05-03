@@ -236,18 +236,55 @@ async function ensureGitHubRepo(repoName) {
   console.log("GitHub repo created:", repoName);
 }
 
+async function getExistingGitHubFileSha({ owner, repoName, filePath }) {
+  const safePath = encodeURIComponent(filePath).replace(/%2F/g, "/");
+
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repoName}/contents/${safePath}`,
+    {
+      method: "GET",
+      headers: githubHeaders(),
+    }
+  );
+
+  if (res.status === 404) {
+    return null;
+  }
+
+  const text = await res.text();
+
+  if (!res.ok) {
+    throw new Error(`GitHub SHA lookup failed for ${filePath}: ${res.status} ${text}`);
+  }
+
+  const json = JSON.parse(text);
+  return json.sha || null;
+}
+
 async function uploadFileToGitHub({ owner, repoName, filePath, content }) {
   const safePath = encodeURIComponent(filePath).replace(/%2F/g, "/");
+
+  const existingSha = await getExistingGitHubFileSha({
+    owner,
+    repoName,
+    filePath,
+  });
+
+  const body = {
+    message: existingSha ? `Update ${filePath}` : `Add ${filePath}`,
+    content: content.toString("base64"),
+  };
+
+  if (existingSha) {
+    body.sha = existingSha;
+  }
 
   const res = await fetch(
     `https://api.github.com/repos/${owner}/${repoName}/contents/${safePath}`,
     {
       method: "PUT",
       headers: githubHeaders(),
-      body: JSON.stringify({
-        message: `Add ${filePath}`,
-        content: content.toString("base64"),
-      }),
+      body: JSON.stringify(body),
     }
   );
 
