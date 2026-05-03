@@ -199,6 +199,43 @@ function detectFramework(files) {
   };
 }
 
+async function ensureGitHubRepo(repoName) {
+  const owner = process.env.GITHUB_USERNAME;
+
+  const checkRes = await fetch(`https://api.github.com/repos/${owner}/${repoName}`, {
+    method: "GET",
+    headers: githubHeaders(),
+  });
+
+  if (checkRes.ok) {
+    console.log("GitHub repo already exists:", repoName);
+    return;
+  }
+
+  if (checkRes.status !== 404) {
+    const text = await checkRes.text();
+    throw new Error(`GitHub repo check failed: ${checkRes.status} ${text}`);
+  }
+
+  const createRes = await fetch("https://api.github.com/user/repos", {
+    method: "POST",
+    headers: githubHeaders(),
+    body: JSON.stringify({
+      name: repoName,
+      private: true,
+      auto_init: false,
+    }),
+  });
+
+  const text = await createRes.text();
+
+  if (!createRes.ok) {
+    throw new Error(`GitHub repo create failed: ${createRes.status} ${text}`);
+  }
+
+  console.log("GitHub repo created:", repoName);
+}
+
 async function uploadFileToGitHub({ owner, repoName, filePath, content }) {
   const safePath = encodeURIComponent(filePath).replace(/%2F/g, "/");
 
@@ -300,6 +337,8 @@ app.post("/process-zip", async (req, res) => {
         return { entry, filePath };
       })
       .filter(({ filePath }) => filePath && !shouldSkipFile(filePath));
+
+await ensureGitHubRepo(repo_name);
 
     console.log(`Uploading ${files.length} files to GitHub repo: ${repo_name}`);
 
