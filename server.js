@@ -71,8 +71,11 @@ async function updateWebsiteOrder(websiteOrderId, acf) {
 function shouldSkipFile(filePath) {
   return (
     filePath.includes("node_modules/") ||
+    filePath.startsWith("node_modules/") ||
+    filePath.includes("/node_modules/") ||
     filePath.includes(".git/") ||
-    filePath.endsWith(".DS_Store")
+    filePath.endsWith(".DS_Store") ||
+    filePath.includes(".manus-logs/")
   );
 }
 
@@ -135,15 +138,27 @@ function rewriteManusStorageImagePaths(content, filePath) {
 function findProjectRootPrefix(entries) {
   const fileNames = entries
     .filter((entry) => !entry.isDirectory)
-    .map((entry) => entry.entryName.replace(/^\/+/, ""));
+    .map((entry) => entry.entryName.replace(/^\/+/, ""))
+    .filter((name) => !name.includes("node_modules/"));
 
-  const packageJsonPath = fileNames.find((name) => name.endsWith("/package.json"));
-
-  if (!packageJsonPath) {
+  // Best case: package.json is already at ZIP root
+  if (fileNames.includes("package.json")) {
     return "";
   }
 
-  return packageJsonPath.replace(/package\.json$/, "");
+  // Common Manus export: one top-level folder containing package.json
+  const packageJsonPaths = fileNames.filter((name) => name.endsWith("/package.json"));
+
+  const preferred = packageJsonPaths.find((name) => {
+    const parts = name.split("/");
+    return parts.length === 2;
+  });
+
+  if (preferred) {
+    return preferred.replace(/package\.json$/, "");
+  }
+
+  return "";
 }
 
 function normalizeFilePath(entryName, rootPrefix) {
