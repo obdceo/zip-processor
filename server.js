@@ -334,6 +334,27 @@ async function createCloudflarePagesProject({
   return json.result;
 }
 
+async function triggerCloudflarePagesDeployment(projectName) {
+  const res = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/pages/projects/${projectName}/deployments`,
+    {
+      method: "POST",
+      headers: cloudflareHeaders(),
+      body: JSON.stringify({}),
+    }
+  );
+
+  const json = await res.json();
+
+  if (!res.ok) {
+    throw new Error(`Cloudflare Pages deployment trigger failed: ${JSON.stringify(json)}`);
+  }
+
+  console.log("Cloudflare Pages deployment triggered:", projectName);
+
+  return json.result;
+}
+
 app.post("/process-zip", async (req, res) => {
   const { website_order_id, repo_name, zip_url } = req.body || {};
 
@@ -413,6 +434,8 @@ const pagesProject = await createCloudflarePagesProject({
   outputDir: buildConfig.output_dir,
 });
 
+const pagesDeployment = await triggerCloudflarePagesDeployment(pagesProject.name);
+
 const previewUrl = `https://${pagesProject.subdomain}`;
 
 try {
@@ -438,6 +461,8 @@ return res.status(200).json({
   status: "deployed",
   framework: buildConfig.framework,
   deployed_preview_url: previewUrl,
+  cloudflare_project: pagesProject.name,
+  cloudflare_deployment_id: pagesDeployment.id,
 });
 } catch (err) {
   const message = err?.stack || err?.message || String(err);
