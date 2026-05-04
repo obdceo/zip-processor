@@ -116,19 +116,45 @@ function getReplacementImageUrl(originalPath) {
   return "https://images.unsplash.com/photo-1497366754035-f200968a6e72?auto=format&fit=crop&w=1600&q=80";
 }
 
-function rewriteManusStorageImagePaths(content, filePath) {
+function rewriteManusStorageImagePaths(content, filePath, files) {
   if (!isTextFileForImageRewrite(filePath)) {
     return content;
   }
 
   let text = content.toString("utf8");
 
+  const localImages = files
+    .map((f) => f.filePath)
+    .filter((p) =>
+      p.startsWith("client/public/images/") ||
+      p.startsWith("public/images/")
+    )
+    .map((p) => p.split("/").pop());
+
   text = text.replace(
-    /\/manus-storage\/[^"'`)\s]+?\.(jpg|jpeg|png|webp|gif)/gi,
-    (match) => {
-      const replacement = getReplacementImageUrl(match);
-      console.log(`Rewrote image path in ${filePath}: ${match} -> ${replacement}`);
-      return replacement;
+    /\/manus-storage\/([^"'`)\s]+?\.(jpg|jpeg|png|webp|gif))/gi,
+    (match, filename) => {
+      const cleanFilename = filename.split("/").pop();
+
+      const localMatch = localImages.find(
+        (img) => img.toLowerCase() === cleanFilename.toLowerCase()
+      );
+
+      if (localMatch) {
+        const replacement = `/images/${localMatch}`;
+        console.log(
+          `Mapped Manus image in ${filePath}: ${match} -> ${replacement}`
+        );
+        return replacement;
+      }
+
+      const fallback = getReplacementImageUrl(match);
+
+      console.log(
+        `Fallback image in ${filePath}: ${match} -> ${fallback}`
+      );
+
+      return fallback;
     }
   );
 
@@ -425,9 +451,11 @@ const hasLocalImages = files.some(({ filePath }) =>
 
 console.log("Local images detected:", hasLocalImages);
 
-const uploadContent = hasLocalImages
-  ? originalContent
-  : rewriteManusStorageImagePaths(originalContent, filePath);
+const uploadContent = rewriteManusStorageImagePaths(
+  originalContent,
+  filePath,
+  files
+);
 
   await uploadFileToGitHub({
     owner: process.env.GITHUB_USERNAME,
