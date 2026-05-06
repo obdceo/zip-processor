@@ -90,75 +90,164 @@ function isTextFileForImageRewrite(filePath) {
   );
 }
 
-function getReplacementImageUrl(originalPath) {
-  const lower = originalPath.toLowerCase();
-
-  if (lower.includes("coworking")) {
-    return "https://images.unsplash.com/photo-1497366754035-f200968a6e72?auto=format&fit=crop&w=1600&q=80";
-  }
-
-  if (lower.includes("office") || lower.includes("workspace")) {
-    return "https://images.unsplash.com/photo-1497366811353-6870744d04b2?auto=format&fit=crop&w=1600&q=80";
-  }
-
-  if (lower.includes("conference") || lower.includes("meeting")) {
-    return "https://images.unsplash.com/photo-1517502884422-41eaead166d4?auto=format&fit=crop&w=1600&q=80";
-  }
-
-  if (lower.includes("sustain") || lower.includes("green") || lower.includes("eco")) {
-    return "https://images.unsplash.com/photo-1497215728101-856f4ea42174?auto=format&fit=crop&w=1600&q=80";
-  }
-
-  if (lower.includes("team") || lower.includes("people")) {
-    return "https://images.unsplash.com/photo-1519389950473-47ba0277781c?auto=format&fit=crop&w=1600&q=80";
-  }
-
-  return "https://images.unsplash.com/photo-1497366754035-f200968a6e72?auto=format&fit=crop&w=1600&q=80";
+function isImageFilePath(filePath) {
+  return /\.(jpg|jpeg|png|webp|gif|svg)$/i.test(filePath);
 }
 
-function rewriteManusStorageImagePaths(content, filePath, files) {
+function getPublicImageFilename(filePath) {
+  return filePath.split("/").pop();
+}
+
+function getZipOrigin(zipUrl) {
+  try {
+    return new URL(zipUrl).origin;
+  } catch {
+    return "";
+  }
+}
+
+function sanitizeImageFilename(filename) {
+  return String(filename || "")
+    .split("/")
+    .pop()
+    .replace(/[^a-zA-Z0-9._-]/g, "-");
+}
+
+function getManusStorageImageRefsFromText(content) {
+  const text = content.toString("utf8");
+  const refs = new Set();
+  const regex = /\/manus-storage\/[^"'`)\s]+?\.(jpg|jpeg|png|webp|gif|svg)/gi;
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    refs.add(match[0]);
+  }
+
+  return Array.from(refs);
+}
+
+function rewriteImageReferences(content, filePath, imageReferenceMap) {
   if (!isTextFileForImageRewrite(filePath)) {
     return content;
   }
 
   let text = content.toString("utf8");
 
-  const localImages = files
-    .map((f) => f.filePath)
-    .filter((p) =>
-      p.startsWith("client/public/images/") ||
-      p.startsWith("public/images/")
-    )
-    .map((p) => p.split("/").pop());
-
-  text = text.replace(
-    /\/manus-storage\/([^"'`)\s]+?\.(jpg|jpeg|png|webp|gif))/gi,
-    (match, filename) => {
-      const cleanFilename = filename.split("/").pop();
-
-      const localMatch = localImages.find(
-        (img) => img.toLowerCase() === cleanFilename.toLowerCase()
-      );
-
-      if (localMatch) {
-        const replacement = `/images/${localMatch}`;
-        console.log(
-          `Mapped Manus image in ${filePath}: ${match} -> ${replacement}`
-        );
-        return replacement;
-      }
-
-      const fallback = getReplacementImageUrl(match);
-
-      console.log(
-        `Fallback image in ${filePath}: ${match} -> ${fallback}`
-      );
-
-      return fallback;
-    }
-  );
+  for (const [originalRef, replacementRef] of imageReferenceMap.entries()) {
+    text = text.split(originalRef).join(replacementRef);
+  }
 
   return Buffer.from(text, "utf8");
+}
+
+async function downloadImageBuffer(url) {
+  const res = await fetch(url, {
+    headers: {
+      Accept: "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
+      "User-Agent": "obd-zip-processor",
+    },
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Image download failed: ${res.status} ${url} ${text.slice(0, 200)}`);
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+
+  if (!contentType.startsWith("image/")) {
+    throw new Error(`Image URL did not return an image: ${url} (${contentType})`);
+  }
+
+  return Buffer.from(await res.arrayBuffer());
+}
+
+async function normalizeManusImageAssets({ files, zipUrl }) {
+  const localImages = files
+    .map((f) => f.filePath)
+    .filter((filePath) =>
+      isImageFilePath(filePath) &&
+      (
+        filePath.startsWith("client/public/images/") ||
+        filePath.startsWith("public/images/")
+      )
+    );
+
+  const localImageByFilename = new Map();
+
+  for (const imagePath of localImages) {
+    const filename = getPublicImageFilename(imagePath);
+    if (filename) {
+      localImageByFilename.set(filename.toLowerCase(), imagePath);
+    }
+  }
+
+  const manuscriptRefs = new Set();
+
+  for (const { entry, filePath } of files) {
+    if (!isTextFileForImageRewrite(filePath)) continue;
+
+    for (const ref of getManusStorageImageRefsFromText(entry.getData())) {
+      manuscriptRefs.add(ref);
+    }
+  }
+
+  const imageReferenceMap = new Map();
+  const generatedImages = [];
+  const unresolvedRefs = [];
+  const zipOrigin = getZipOrigin(zipUrl);
+
+  console.log("Local exported images detected:", localImages.length);
+  console.log("Manus storage image references detected:", manuscriptRefs.size);
+
+  for (const ref of manuscriptRefs) {
+    const rawFilename = sanitizeImageFilename(ref);
+    const filename = rawFilename || `image-${generatedImages.length + 1}.jpg`;
+    const localMatchPath = localImageByFilename.get(filename.toLowerCase());
+
+    if (localMatchPath) {
+      imageReferenceMap.set(ref, `/images/${filename}`);
+      console.log(`Mapped Manus image to exported local asset: ${ref} -> /images/${filename}`);
+      continue;
+    }
+
+    if (!zipOrigin) {
+      unresolvedRefs.push(ref);
+      continue;
+    }
+
+    const remoteUrl = `${zipOrigin}${ref}`;
+
+    try {
+      const imageBuffer = await downloadImageBuffer(remoteUrl);
+      const targetPath = `client/public/images/${filename}`;
+
+      generatedImages.push({
+        filePath: targetPath,
+        content: imageBuffer,
+        sourceUrl: remoteUrl,
+      });
+
+      imageReferenceMap.set(ref, `/images/${filename}`);
+      console.log(`Downloaded missing Manus image: ${remoteUrl} -> ${targetPath}`);
+    } catch (err) {
+      console.error(`Could not resolve Manus image ${ref}:`, err?.message || String(err));
+      unresolvedRefs.push(ref);
+    }
+  }
+
+  if (unresolvedRefs.length > 0) {
+    throw new Error(
+      `Unresolved Manus image assets. Refusing to deploy guessed/broken images: ${unresolvedRefs.join(", ")}`
+    );
+  }
+
+  return {
+    imageReferenceMap,
+    generatedImages,
+    localImageCount: localImages.length,
+    manusImageRefCount: manuscriptRefs.size,
+  };
 }
 
 function findProjectRootPrefix(entries) {
@@ -235,7 +324,7 @@ function detectFramework(files) {
 
   return {
     framework: "vite",
-    build_command: "pnpm install && pnpm run build",
+    build_command: "pnpm install --no-frozen-lockfile && pnpm run build",
     output_dir: "dist/public",
   };
 }
@@ -439,22 +528,20 @@ app.post("/process-zip", async (req, res) => {
 
 await ensureGitHubRepo(repo_name);
 
+const imageNormalization = await normalizeManusImageAssets({
+  files,
+  zipUrl: zip_url,
+});
+
     console.log(`Uploading ${files.length} files to GitHub repo: ${repo_name}`);
 
     for (const { entry, filePath } of files) {
   const originalContent = entry.getData();
 
-const hasLocalImages = files.some(({ filePath }) =>
-  filePath.startsWith("client/public/images/") ||
-  filePath.startsWith("public/images/")
-);
-
-console.log("Local images detected:", hasLocalImages);
-
-const uploadContent = rewriteManusStorageImagePaths(
+const uploadContent = rewriteImageReferences(
   originalContent,
   filePath,
-  files
+  imageNormalization.imageReferenceMap
 );
 
   await uploadFileToGitHub({
@@ -467,11 +554,25 @@ const uploadContent = rewriteManusStorageImagePaths(
   console.log("Uploaded:", filePath);
 }
 
+for (const image of imageNormalization.generatedImages) {
+  await uploadFileToGitHub({
+    owner: process.env.GITHUB_USERNAME,
+    repoName: repo_name,
+    filePath: image.filePath,
+    content: image.content,
+  });
+
+  console.log("Uploaded downloaded image:", image.filePath);
+}
+
 await uploadFileToGitHub({
   owner: process.env.GITHUB_USERNAME,
   repoName: repo_name,
   filePath: ".npmrc",
-  content: Buffer.from("legacy-peer-deps=true\n", "utf8"),
+  content: Buffer.from(
+    "legacy-peer-deps=true\nauto-install-peers=true\nstrict-peer-dependencies=false\nfrozen-lockfile=false\n",
+    "utf8"
+  ),
 });
 
 console.log("Uploaded: .npmrc");
