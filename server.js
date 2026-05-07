@@ -2,12 +2,20 @@ import express from "express";
 import fetch from "node-fetch";
 import AdmZip from "adm-zip";
 
-console.log("ZIP PROCESSOR BUILD v4");
+console.log("ZIP PROCESSOR BUILD v5 - image recovery");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3000;
+
+class AssetResolutionError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "AssetResolutionError";
+    this.details = details;
+  }
+}
 
 app.get("/health", (req, res) => {
   res.json({ ok: true });
@@ -65,7 +73,60 @@ async function updateWebsiteOrder(websiteOrderId, acf) {
     throw new Error(`WP update failed: ${res.status} ${text}`);
   }
 
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new Error(`WP returned non-JSON response: ${text.slice(0, 500)}`);
+  }
+}
+
+async function notifyNeedsAttention({ websiteOrderId, repoName, zipUrl, reason, missingAssets = [] }) {
+  const apiKey = process.env.RESEND_API_KEY;
+  const to = process.env.INTERNAL_ALERT_EMAIL;
+  const from = process.env.ALERT_FROM_EMAIL || "Website Essentials <support@olivebranchdigital.com>";
+
+  if (!apiKey || !to) {
+    console.log("Needs-attention email skipped: RESEND_API_KEY or INTERNAL_ALERT_EMAIL missing");
+    return;
+  }
+
+  const subject = `WE Build Needs Attention — Order #${websiteOrderId}`;
+
+  const body = [
+    `Website Essentials build needs attention.`,
+    ``,
+    `Order: ${websiteOrderId}`,
+    `Repo: ${repoName}`,
+    `ZIP URL: ${zipUrl}`,
+    `Reason: ${reason}`,
+    ``,
+    missingAssets.length ? `Missing assets:\n${missingAssets.map((a) => `- ${a}`).join("\n")}` : "",
+    ``,
+    `The deployment was stopped before a broken or guessed-image site could go live.`,
+  ].join("\n");
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from,
+      to,
+      subject,
+      text: body,
+    }),
+  });
+
+  const text = await res.text();
+
+  if (!res.ok) {
+    console.error("Needs-attention email failed:", res.status, text);
+    return;
+  }
+
+  console.log("Needs-attention email sent");
 }
 
 function shouldSkipFile(filePath) {
@@ -86,168 +147,229 @@ function isTextFileForImageRewrite(filePath) {
     filePath.endsWith(".jsx") ||
     filePath.endsWith(".js") ||
     filePath.endsWith(".html") ||
-    filePath.endsWith(".css")
+    filePath.endsWith(".css") ||
+    filePath.endsWith(".json")
   );
 }
 
-function isImageFilePath(filePath) {
+function isImageFile(filePath) {
   return /\.(jpg|jpeg|png|webp|gif|svg)$/i.test(filePath);
 }
 
-function getPublicImageFilename(filePath) {
-  return filePath.split("/").pop();
-}
-
-function getZipOrigin(zipUrl) {
-  try {
-    return new URL(zipUrl).origin;
-  } catch {
-    return "";
-  }
-}
-
-function sanitizeImageFilename(filename) {
+function sanitizeAssetFilename(filename) {
   return String(filename || "")
     .split("/")
     .pop()
     .replace(/[^a-zA-Z0-9._-]/g, "-");
 }
 
-function getManusStorageImageRefsFromText(content) {
-  const text = content.toString("utf8");
+function getLocalImageFilePaths(files) {
+  return files
+    .map((f) => f.filePath)
+    .filter((p) =>
+      (p.startsWith("client/public/images/") || p.startsWith("public/images/")) &&
+      isImageFile(p)
+    );
+}
+
+function getPublicImagePathForLocalFile(filePath) {
+  if (filePath.startsWith("client/public/")) {
+    return `/${filePath.replace("client/public/", "")}`;
+  }
+
+  if (filePath.startsWith("public/")) {
+    return `/${filePath.replace("public/", "")}`;
+  }
+
+  return filePath;
+}
+
+function getManusStorageRefsFromText(text) {
   const refs = new Set();
   const regex = /\/manus-storage\/[^"'`)\s]+?\.(jpg|jpeg|png|webp|gif|svg)/gi;
-  let match;
 
+  let match;
   while ((match = regex.exec(text)) !== null) {
     refs.add(match[0]);
   }
 
-  return Array.from(refs);
+  return [...refs];
 }
 
-function rewriteImageReferences(content, filePath, imageReferenceMap) {
-  if (!isTextFileForImageRewrite(filePath)) {
-    return content;
+function getAllManusStorageRefs(files) {
+  const refs = new Set();
+
+  for (const file of files) {
+    if (!isTextFileForImageRewrite(file.filePath)) continue;
+
+    const content = file.content || file.entry?.getData();
+    if (!content) continue;
+
+    const text = content.toString("utf8");
+    for (const ref of getManusStorageRefsFromText(text)) {
+      refs.add(ref);
+    }
   }
 
-  let text = content.toString("utf8");
-
-  for (const [originalRef, replacementRef] of imageReferenceMap.entries()) {
-    text = text.split(originalRef).join(replacementRef);
-  }
-
-  return Buffer.from(text, "utf8");
+  return [...refs];
 }
 
-async function downloadImageBuffer(url) {
-  const res = await fetch(url, {
+function deriveAssetBaseUrl({ zipUrl, assetBaseUrl }) {
+  if (assetBaseUrl) {
+    return String(assetBaseUrl).trim().replace(/\/$/, "");
+  }
+
+  try {
+    const url = new URL(zipUrl);
+
+    // Runtime Manus URLs often look like:
+    // https://3000-xxxxx.us2.manus.computer/manus-storage/site-source.zip
+    // In that case, the same origin can usually serve /manus-storage/image.jpg
+    if (url.hostname.includes("manus.computer")) {
+      return url.origin;
+    }
+  } catch (err) {
+    console.log("Could not derive asset base URL from ZIP URL:", err.message);
+  }
+
+  return "";
+}
+
+function createLocalImageIndex(files) {
+  const index = new Map();
+
+  for (const filePath of getLocalImageFilePaths(files)) {
+    const filename = filePath.split("/").pop();
+    index.set(filename.toLowerCase(), {
+      filePath,
+      publicPath: getPublicImagePathForLocalFile(filePath),
+    });
+  }
+
+  return index;
+}
+
+async function fetchManusAsset({ assetBaseUrl, ref }) {
+  if (!assetBaseUrl) return null;
+
+  const assetUrl = `${assetBaseUrl}${ref}`;
+
+  console.log("Attempting Manus asset download:", assetUrl);
+
+  const res = await fetch(assetUrl, {
     headers: {
-      Accept: "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
+      Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
       "User-Agent": "obd-zip-processor",
     },
   });
 
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Image download failed: ${res.status} ${url} ${text.slice(0, 200)}`);
+    console.log("Manus asset download failed:", res.status, assetUrl);
+    return null;
   }
 
   const contentType = res.headers.get("content-type") || "";
 
-  if (!contentType.startsWith("image/")) {
-    throw new Error(`Image URL did not return an image: ${url} (${contentType})`);
+  if (!contentType.startsWith("image/") && !ref.toLowerCase().endsWith(".svg")) {
+    console.log("Manus asset was not an image:", contentType, assetUrl);
+    return null;
   }
 
   return Buffer.from(await res.arrayBuffer());
 }
 
-async function normalizeManusImageAssets({ files, zipUrl }) {
-  const localImages = files
-    .map((f) => f.filePath)
-    .filter((filePath) =>
-      isImageFilePath(filePath) &&
-      (
-        filePath.startsWith("client/public/images/") ||
-        filePath.startsWith("public/images/")
-      )
-    );
+async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
+  const refs = getAllManusStorageRefs(files);
 
-  const localImageByFilename = new Map();
-
-  for (const imagePath of localImages) {
-    const filename = getPublicImageFilename(imagePath);
-    if (filename) {
-      localImageByFilename.set(filename.toLowerCase(), imagePath);
-    }
+  if (!refs.length) {
+    console.log("No /manus-storage/ image references found");
+    return files;
   }
 
-  const manuscriptRefs = new Set();
+  console.log("Found Manus image references:", refs);
 
-  for (const { entry, filePath } of files) {
-    if (!isTextFileForImageRewrite(filePath)) continue;
+  const resolvedAssetBaseUrl = deriveAssetBaseUrl({ zipUrl, assetBaseUrl });
+  let localImageIndex = createLocalImageIndex(files);
 
-    for (const ref of getManusStorageImageRefsFromText(entry.getData())) {
-      manuscriptRefs.add(ref);
-    }
-  }
+  const filesToAdd = [];
+  const refToPublicPath = new Map();
+  const unresolved = [];
 
-  const imageReferenceMap = new Map();
-  const generatedImages = [];
-  const unresolvedRefs = [];
-  const zipOrigin = getZipOrigin(zipUrl);
+  for (const ref of refs) {
+    const filename = sanitizeAssetFilename(ref);
+    const localMatch = localImageIndex.get(filename.toLowerCase());
 
-  console.log("Local exported images detected:", localImages.length);
-  console.log("Manus storage image references detected:", manuscriptRefs.size);
-
-  for (const ref of manuscriptRefs) {
-    const rawFilename = sanitizeImageFilename(ref);
-    const filename = rawFilename || `image-${generatedImages.length + 1}.jpg`;
-    const localMatchPath = localImageByFilename.get(filename.toLowerCase());
-
-    if (localMatchPath) {
-      imageReferenceMap.set(ref, `/images/${filename}`);
-      console.log(`Mapped Manus image to exported local asset: ${ref} -> /images/${filename}`);
+    if (localMatch) {
+      refToPublicPath.set(ref, localMatch.publicPath);
+      console.log(`Using existing local image for ${ref}: ${localMatch.publicPath}`);
       continue;
     }
 
-    if (!zipOrigin) {
-      unresolvedRefs.push(ref);
-      continue;
-    }
+    const downloaded = await fetchManusAsset({
+      assetBaseUrl: resolvedAssetBaseUrl,
+      ref,
+    });
 
-    const remoteUrl = `${zipOrigin}${ref}`;
+    if (downloaded) {
+      const localPath = `client/public/images/${filename}`;
+      const publicPath = `/images/${filename}`;
 
-    try {
-      const imageBuffer = await downloadImageBuffer(remoteUrl);
-      const targetPath = `client/public/images/${filename}`;
-
-      generatedImages.push({
-        filePath: targetPath,
-        content: imageBuffer,
-        sourceUrl: remoteUrl,
+      filesToAdd.push({
+        entry: null,
+        filePath: localPath,
+        content: downloaded,
+        generated: true,
       });
 
-      imageReferenceMap.set(ref, `/images/${filename}`);
-      console.log(`Downloaded missing Manus image: ${remoteUrl} -> ${targetPath}`);
-    } catch (err) {
-      console.error(`Could not resolve Manus image ${ref}:`, err?.message || String(err));
-      unresolvedRefs.push(ref);
+      refToPublicPath.set(ref, publicPath);
+      localImageIndex.set(filename.toLowerCase(), {
+        filePath: localPath,
+        publicPath,
+      });
+
+      console.log(`Downloaded and staged Manus image ${ref} -> ${localPath}`);
+      continue;
     }
+
+    unresolved.push(ref);
   }
 
-  if (unresolvedRefs.length > 0) {
-    throw new Error(
-      `Unresolved Manus image assets. Refusing to deploy guessed/broken images: ${unresolvedRefs.join(", ")}`
+  if (unresolved.length) {
+    throw new AssetResolutionError(
+      `Unresolved Manus image assets. Refusing to deploy guessed/broken images: ${unresolved.join(", ")}`,
+      {
+        unresolved,
+        assetBaseUrl: resolvedAssetBaseUrl,
+      }
     );
   }
 
-  return {
-    imageReferenceMap,
-    generatedImages,
-    localImageCount: localImages.length,
-    manusImageRefCount: manuscriptRefs.size,
-  };
+  const normalizedFiles = files.map((file) => {
+    if (!isTextFileForImageRewrite(file.filePath)) {
+      return file;
+    }
+
+    const originalContent = file.content || file.entry.getData();
+    let text = originalContent.toString("utf8");
+    let changed = false;
+
+    for (const [ref, publicPath] of refToPublicPath.entries()) {
+      if (text.includes(ref)) {
+        text = text.split(ref).join(publicPath);
+        changed = true;
+        console.log(`Rewrote image ref in ${file.filePath}: ${ref} -> ${publicPath}`);
+      }
+    }
+
+    if (!changed) return file;
+
+    return {
+      ...file,
+      content: Buffer.from(text, "utf8"),
+    };
+  });
+
+  return [...normalizedFiles, ...filesToAdd];
 }
 
 function findProjectRootPrefix(entries) {
@@ -486,7 +608,7 @@ async function triggerCloudflarePagesDeployment(projectName) {
 }
 
 app.post("/process-zip", async (req, res) => {
-  const { website_order_id, repo_name, zip_url } = req.body || {};
+  const { website_order_id, repo_name, zip_url, asset_base_url } = req.body || {};
 
   try {
     if (!website_order_id || !repo_name || !zip_url) {
@@ -518,126 +640,133 @@ app.post("/process-zip", async (req, res) => {
 
     console.log("Detected root prefix:", rootPrefix || "(none)");
 
-    const files = entries
+    let files = entries
       .filter((entry) => !entry.isDirectory)
       .map((entry) => {
         const filePath = normalizeFilePath(entry.entryName, rootPrefix);
-        return { entry, filePath };
+        return {
+          entry,
+          filePath,
+          content: entry.getData(),
+          generated: false,
+        };
       })
       .filter(({ filePath }) => filePath && !shouldSkipFile(filePath));
 
-await ensureGitHubRepo(repo_name);
+    files = await normalizeManusImageAssets({
+      files,
+      zipUrl: zip_url,
+      assetBaseUrl: asset_base_url,
+    });
 
-const imageNormalization = await normalizeManusImageAssets({
-  files,
-  zipUrl: zip_url,
-});
+    await ensureGitHubRepo(repo_name);
 
     console.log(`Uploading ${files.length} files to GitHub repo: ${repo_name}`);
 
-    for (const { entry, filePath } of files) {
-  const originalContent = entry.getData();
+    for (const { content, entry, filePath } of files) {
+      const uploadContent = content || entry.getData();
 
-const uploadContent = rewriteImageReferences(
-  originalContent,
-  filePath,
-  imageNormalization.imageReferenceMap
-);
+      await uploadFileToGitHub({
+        owner: process.env.GITHUB_USERNAME,
+        repoName: repo_name,
+        filePath,
+        content: uploadContent,
+      });
 
-  await uploadFileToGitHub({
-    owner: process.env.GITHUB_USERNAME,
-    repoName: repo_name,
-    filePath,
-    content: uploadContent,
-  });
+      console.log("Uploaded:", filePath);
+    }
 
-  console.log("Uploaded:", filePath);
-}
+    await uploadFileToGitHub({
+      owner: process.env.GITHUB_USERNAME,
+      repoName: repo_name,
+      filePath: ".npmrc",
+      content: Buffer.from(
+        "legacy-peer-deps=true\nauto-install-peers=true\nstrict-peer-dependencies=false\nfrozen-lockfile=false\n",
+        "utf8"
+      ),
+    });
 
-for (const image of imageNormalization.generatedImages) {
-  await uploadFileToGitHub({
-    owner: process.env.GITHUB_USERNAME,
-    repoName: repo_name,
-    filePath: image.filePath,
-    content: image.content,
-  });
+    console.log("Uploaded: .npmrc");
 
-  console.log("Uploaded downloaded image:", image.filePath);
-}
+    const buildConfig = detectFramework(files);
 
-await uploadFileToGitHub({
-  owner: process.env.GITHUB_USERNAME,
-  repoName: repo_name,
-  filePath: ".npmrc",
-  content: Buffer.from(
-    "legacy-peer-deps=true\nauto-install-peers=true\nstrict-peer-dependencies=false\nfrozen-lockfile=false\n",
-    "utf8"
-  ),
-});
+    console.log("Detected framework:", buildConfig.framework);
 
-console.log("Uploaded: .npmrc");
+    const pagesProject = await createCloudflarePagesProject({
+      repoName: repo_name,
+      productionBranch: "main",
+      buildCommand: buildConfig.build_command,
+      outputDir: buildConfig.output_dir,
+    });
 
-const buildConfig = detectFramework(files);
+    const pagesDeployment = await triggerCloudflarePagesDeployment(pagesProject.name);
 
-console.log("Detected framework:", buildConfig.framework);
+    const previewUrl = `https://${pagesProject.subdomain}`;
 
-const pagesProject = await createCloudflarePagesProject({
-  repoName: repo_name,
-  productionBranch: "main",
-  buildCommand: buildConfig.build_command,
-  outputDir: buildConfig.output_dir,
-});
-
-const pagesDeployment = await triggerCloudflarePagesDeployment(pagesProject.name);
-
-const previewUrl = `https://${pagesProject.subdomain}`;
-
-try {
-  await updateWebsiteOrder(website_order_id, {
-    github_push_status: "pushed",
-    github_pushed_at: new Date().toISOString(),
-    deployment_provider: "cloudflare_pages",
-    deployment_status: "deployed",
-    deployed_preview_url: previewUrl,
-    cloudflare_project_name: pagesProject.name,
-  });
-
-  console.log("WP updated: pushed and deployed");
-} catch (wpErr) {
-  console.error("WP update failed:", wpErr.message);
-}
-
-return res.status(200).json({
-  ok: true,
-  website_order_id,
-  repo_name,
-  uploaded_files: files.length,
-  status: "deployed",
-  framework: buildConfig.framework,
-  deployed_preview_url: previewUrl,
-  cloudflare_project: pagesProject.name,
-  cloudflare_deployment_id: pagesDeployment.id,
-});
-} catch (err) {
-  const message = err?.stack || err?.message || String(err);
-  console.error("ZIP processor error:", message);
-
-  try {
-    if (website_order_id) {
+    try {
       await updateWebsiteOrder(website_order_id, {
-        github_push_status: "failed",
-        deployment_status: "failed",
+        github_push_status: "pushed",
+        github_pushed_at: new Date().toISOString(),
+        deployment_provider: "cloudflare_pages",
+        deployment_status: "deployed",
+        deployed_preview_url: previewUrl,
+        cloudflare_project_name: pagesProject.name,
+      });
+
+      console.log("WP updated: pushed and deployed");
+    } catch (wpErr) {
+      console.error("WP update failed:", wpErr.message);
+    }
+
+    return res.status(200).json({
+      ok: true,
+      website_order_id,
+      repo_name,
+      uploaded_files: files.length,
+      status: "deployed",
+      framework: buildConfig.framework,
+      deployed_preview_url: previewUrl,
+      cloudflare_project: pagesProject.name,
+      cloudflare_deployment_id: pagesDeployment.id,
+    });
+  } catch (err) {
+    const message = err?.stack || err?.message || String(err);
+    console.error("ZIP processor error:", message);
+
+    const isAssetError = err instanceof AssetResolutionError;
+    const deploymentStatus = isAssetError ? "needs_attention" : "failed";
+
+    try {
+      if (website_order_id) {
+        await updateWebsiteOrder(website_order_id, {
+          github_push_status: isAssetError ? "blocked" : "failed",
+          deployment_status: deploymentStatus,
+          order_status: deploymentStatus,
+          deployment_error: err?.message || String(err),
+        });
+      }
+    } catch (wpErr) {
+      console.error("Failed to update WP after error:", wpErr?.message || String(wpErr));
+    }
+
+    if (isAssetError) {
+      await notifyNeedsAttention({
+        websiteOrderId: website_order_id,
+        repoName: repo_name,
+        zipUrl: zip_url,
+        reason: err.message,
+        missingAssets: err.details?.unresolved || [],
       });
     }
-  } catch (wpErr) {
-    console.error("Failed to update WP after error:", wpErr?.message || String(wpErr));
-  }
 
-  return res.status(500).json({
-    ok: false,
-    error: message,
-  });
-}
+    return res.status(500).json({
+      ok: false,
+      status: deploymentStatus,
+      error: message,
+      unresolved_assets: isAssetError ? err.details?.unresolved || [] : undefined,
+      asset_base_url_used: isAssetError ? err.details?.assetBaseUrl || "" : undefined,
+    });
+  }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
