@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import AdmZip from "adm-zip";
 
-console.log("ZIP PROCESSOR BUILD v5 - image recovery");
+console.log("ZIP PROCESSOR BUILD v6 - robust Manus image recovery");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -172,6 +172,12 @@ function getLocalImageFilePaths(files) {
     );
 }
 
+function getAllImageFilePaths(files) {
+  return files
+    .map((f) => f.filePath)
+    .filter((p) => isImageFile(p) && !shouldSkipFile(p));
+}
+
 function getPublicImagePathForLocalFile(filePath) {
   if (filePath.startsWith("client/public/")) {
     return `/${filePath.replace("client/public/", "")}`;
@@ -215,8 +221,26 @@ function getAllManusStorageRefs(files) {
 }
 
 function deriveAssetBaseUrl({ zipUrl, assetBaseUrl }) {
+  const candidates = deriveAssetBaseUrls({ zipUrl, assetBaseUrl });
+  return candidates[0] || "";
+}
+
+function deriveAssetBaseUrls({ zipUrl, assetBaseUrl }) {
+  const candidates = [];
+
+  const addCandidate = (value) => {
+    const clean = String(value || "").trim().replace(/\/$/, "");
+    if (clean && !candidates.includes(clean)) {
+      candidates.push(clean);
+    }
+  };
+
   if (assetBaseUrl) {
-    return String(assetBaseUrl).trim().replace(/\/$/, "");
+    String(assetBaseUrl)
+      .split(",")
+      .map((v) => v.trim())
+      .filter(Boolean)
+      .forEach(addCandidate);
   }
 
   try {
@@ -224,58 +248,152 @@ function deriveAssetBaseUrl({ zipUrl, assetBaseUrl }) {
 
     // Runtime Manus URLs often look like:
     // https://3000-xxxxx.us2.manus.computer/manus-storage/site-source.zip
-    // In that case, the same origin can usually serve /manus-storage/image.jpg
-    if (url.hostname.includes("manus.computer")) {
-      return url.origin;
+    // In that case, the same origin can sometimes serve /manus-storage/image.jpg.
+    if (url.hostname.includes("manus.computer") || url.hostname.includes("manus.space")) {
+      addCandidate(url.origin);
     }
   } catch (err) {
     console.log("Could not derive asset base URL from ZIP URL:", err.message);
   }
 
-  return "";
+  // Manus sometimes returns relative /manus-storage paths that are only useful
+  // from a Manus host. This candidate usually returns 404 for publish-only paths,
+  // but it is harmless to try before blocking the deploy.
+  addCandidate("https://manus.im");
+
+  return candidates;
+}
+
+function getFileContent(file) {
+  if (!file) return null;
+  if (file.content) return file.content;
+  if (file.entry) return file.entry.getData();
+  return null;
+}
+
+function normalizeComparableFilename(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\.(jpg|jpeg|png|webp|gif|svg)$/i, "")
+    .replace(/[_-]?[a-f0-9]{6,12}$/i, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function createLocalImageIndex(files) {
   const index = new Map();
+  const byComparableName = new Map();
 
-  for (const filePath of getLocalImageFilePaths(files)) {
+  for (const filePath of getAllImageFilePaths(files)) {
     const filename = filePath.split("/").pop();
-    index.set(filename.toLowerCase(), {
+    const file = files.find((f) => f.filePath === filePath);
+    const alreadyPublic =
+      filePath.startsWith("client/public/") ||
+      filePath.startsWith("public/");
+
+    const record = {
+      file,
       filePath,
-      publicPath: getPublicImagePathForLocalFile(filePath),
-    });
+      filename,
+      alreadyPublic,
+      publicPath: alreadyPublic ? getPublicImagePathForLocalFile(filePath) : `/images/${sanitizeAssetFilename(filename)}`,
+    };
+
+    index.set(filename.toLowerCase(), record);
+
+    const comparable = normalizeComparableFilename(filename);
+    if (comparable && !byComparableName.has(comparable)) {
+      byComparableName.set(comparable, record);
+    }
   }
 
-  return index;
+  return { byExactName: index, byComparableName };
 }
 
-async function fetchManusAsset({ assetBaseUrl, ref }) {
-  if (!assetBaseUrl) return null;
+function findLocalImageMatch(localImageIndex, ref) {
+  const filename = sanitizeAssetFilename(ref);
+  const exact = localImageIndex.byExactName.get(filename.toLowerCase());
 
-  const assetUrl = `${assetBaseUrl}${ref}`;
-
-  console.log("Attempting Manus asset download:", assetUrl);
-
-  const res = await fetch(assetUrl, {
-    headers: {
-      Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-      "User-Agent": "obd-zip-processor",
-    },
-  });
-
-  if (!res.ok) {
-    console.log("Manus asset download failed:", res.status, assetUrl);
-    return null;
+  if (exact) {
+    return exact;
   }
 
-  const contentType = res.headers.get("content-type") || "";
+  const comparable = normalizeComparableFilename(filename);
+  return localImageIndex.byComparableName.get(comparable) || null;
+}
 
-  if (!contentType.startsWith("image/") && !ref.toLowerCase().endsWith(".svg")) {
-    console.log("Manus asset was not an image:", contentType, assetUrl);
-    return null;
+function bufferLooksLikeImage(buffer, ref = "") {
+  if (!buffer || buffer.length < 4) return false;
+
+  const lowerRef = String(ref || "").toLowerCase();
+
+  if (lowerRef.endsWith(".svg")) {
+    const head = buffer.toString("utf8", 0, Math.min(buffer.length, 200)).trim().toLowerCase();
+    return head.startsWith("<svg") || head.includes("<svg");
   }
 
-  return Buffer.from(await res.arrayBuffer());
+  // jpg
+  if (buffer[0] === 0xff && buffer[1] === 0xd8) return true;
+
+  // png
+  if (
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47
+  ) return true;
+
+  // gif
+  if (buffer.toString("ascii", 0, 3) === "GIF") return true;
+
+  // webp
+  if (
+    buffer.toString("ascii", 0, 4) === "RIFF" &&
+    buffer.toString("ascii", 8, 12) === "WEBP"
+  ) return true;
+
+  return false;
+}
+
+async function fetchManusAsset({ assetBaseUrls, assetBaseUrl, ref }) {
+  const candidates = assetBaseUrls?.length ? assetBaseUrls : assetBaseUrl ? [assetBaseUrl] : [];
+
+  for (const baseUrl of candidates) {
+    if (!baseUrl) continue;
+
+    const assetUrl = `${String(baseUrl).replace(/\/$/, "")}${ref}`;
+
+    console.log("Attempting Manus asset download:", assetUrl);
+
+    const res = await fetch(assetUrl, {
+      headers: {
+        Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "User-Agent": "obd-zip-processor",
+      },
+    });
+
+    if (!res.ok) {
+      console.log("Manus asset download failed:", res.status, assetUrl);
+      continue;
+    }
+
+    const contentType = res.headers.get("content-type") || "";
+    const buffer = Buffer.from(await res.arrayBuffer());
+
+    if (!contentType.startsWith("image/") && !bufferLooksLikeImage(buffer, ref)) {
+      console.log("Manus asset was not an image:", contentType, assetUrl);
+      continue;
+    }
+
+    if (!bufferLooksLikeImage(buffer, ref)) {
+      console.log("Downloaded Manus asset failed image signature check:", assetUrl);
+      continue;
+    }
+
+    return buffer;
+  }
+
+  return null;
 }
 
 async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
@@ -288,25 +406,54 @@ async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
 
   console.log("Found Manus image references:", refs);
 
-  const resolvedAssetBaseUrl = deriveAssetBaseUrl({ zipUrl, assetBaseUrl });
+  const resolvedAssetBaseUrls = deriveAssetBaseUrls({ zipUrl, assetBaseUrl });
+  const resolvedAssetBaseUrl = resolvedAssetBaseUrls[0] || "";
   let localImageIndex = createLocalImageIndex(files);
 
+  const existingPaths = new Set(files.map((f) => f.filePath));
   const filesToAdd = [];
   const refToPublicPath = new Map();
   const unresolved = [];
 
   for (const ref of refs) {
     const filename = sanitizeAssetFilename(ref);
-    const localMatch = localImageIndex.get(filename.toLowerCase());
+    const localMatch = findLocalImageMatch(localImageIndex, ref);
 
     if (localMatch) {
-      refToPublicPath.set(ref, localMatch.publicPath);
-      console.log(`Using existing local image for ${ref}: ${localMatch.publicPath}`);
-      continue;
+      if (localMatch.alreadyPublic) {
+        refToPublicPath.set(ref, localMatch.publicPath);
+        console.log(`Using existing public image for ${ref}: ${localMatch.publicPath}`);
+        continue;
+      }
+
+      const sourceContent = getFileContent(localMatch.file);
+
+      if (sourceContent && bufferLooksLikeImage(sourceContent, localMatch.filename)) {
+        const localPath = `client/public/images/${filename}`;
+        const publicPath = `/images/${filename}`;
+
+        if (!existingPaths.has(localPath)) {
+          filesToAdd.push({
+            entry: null,
+            filePath: localPath,
+            content: sourceContent,
+            generated: true,
+            copiedFrom: localMatch.filePath,
+          });
+
+          existingPaths.add(localPath);
+          console.log(`Copied ZIP-local image ${localMatch.filePath} -> ${localPath}`);
+        }
+
+        refToPublicPath.set(ref, publicPath);
+        continue;
+      }
+
+      console.log(`Local image match had no usable image bytes for ${ref}: ${localMatch.filePath}`);
     }
 
     const downloaded = await fetchManusAsset({
-      assetBaseUrl: resolvedAssetBaseUrl,
+      assetBaseUrls: resolvedAssetBaseUrls,
       ref,
     });
 
@@ -314,18 +461,18 @@ async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
       const localPath = `client/public/images/${filename}`;
       const publicPath = `/images/${filename}`;
 
-      filesToAdd.push({
-        entry: null,
-        filePath: localPath,
-        content: downloaded,
-        generated: true,
-      });
+      if (!existingPaths.has(localPath)) {
+        filesToAdd.push({
+          entry: null,
+          filePath: localPath,
+          content: downloaded,
+          generated: true,
+        });
+
+        existingPaths.add(localPath);
+      }
 
       refToPublicPath.set(ref, publicPath);
-      localImageIndex.set(filename.toLowerCase(), {
-        filePath: localPath,
-        publicPath,
-      });
 
       console.log(`Downloaded and staged Manus image ${ref} -> ${localPath}`);
       continue;
@@ -340,6 +487,7 @@ async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
       {
         unresolved,
         assetBaseUrl: resolvedAssetBaseUrl,
+        assetBaseUrls: resolvedAssetBaseUrls,
       }
     );
   }
@@ -349,7 +497,9 @@ async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
       return file;
     }
 
-    const originalContent = file.content || file.entry.getData();
+    const originalContent = getFileContent(file);
+    if (!originalContent) return file;
+
     let text = originalContent.toString("utf8");
     let changed = false;
 
@@ -741,7 +891,9 @@ app.post("/process-zip", async (req, res) => {
         await updateWebsiteOrder(website_order_id, {
           github_push_status: isAssetError ? "blocked" : "failed",
           deployment_status: deploymentStatus,
-          order_status: deploymentStatus,
+          // Keep order_status within the allowed ACF select values.
+          // "failed" is not always registered as an allowed order_status.
+          order_status: "needs_attention",
           deployment_error: err?.message || String(err),
         });
       }
