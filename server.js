@@ -2,7 +2,7 @@ import express from "express";
 import fetch from "node-fetch";
 import AdmZip from "adm-zip";
 
-console.log("ZIP PROCESSOR BUILD v6 - robust Manus image recovery");
+console.log("ZIP PROCESSOR BUILD v7 - strict Manus image integrity");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -208,7 +208,7 @@ function getAllManusStorageRefs(files) {
   for (const file of files) {
     if (!isTextFileForImageRewrite(file.filePath)) continue;
 
-    const content = file.content || file.entry?.getData();
+    const content = getFileContent(file);
     if (!content) continue;
 
     const text = content.toString("utf8");
@@ -256,9 +256,7 @@ function deriveAssetBaseUrls({ zipUrl, assetBaseUrl }) {
     console.log("Could not derive asset base URL from ZIP URL:", err.message);
   }
 
-  // Manus sometimes returns relative /manus-storage paths that are only useful
-  // from a Manus host. This candidate usually returns 404 for publish-only paths,
-  // but it is harmless to try before blocking the deploy.
+  // Last-resort probe. If Manus returns HTML/404, image signature checks below block it.
   addCandidate("https://manus.im");
 
   return candidates;
@@ -271,18 +269,8 @@ function getFileContent(file) {
   return null;
 }
 
-function normalizeComparableFilename(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/\.(jpg|jpeg|png|webp|gif|svg)$/i, "")
-    .replace(/[_-]?[a-f0-9]{6,12}$/i, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
 function createLocalImageIndex(files) {
-  const index = new Map();
-  const byComparableName = new Map();
+  const byExactName = new Map();
 
   for (const filePath of getAllImageFilePaths(files)) {
     const filename = filePath.split("/").pop();
@@ -299,27 +287,19 @@ function createLocalImageIndex(files) {
       publicPath: alreadyPublic ? getPublicImagePathForLocalFile(filePath) : `/images/${sanitizeAssetFilename(filename)}`,
     };
 
-    index.set(filename.toLowerCase(), record);
-
-    const comparable = normalizeComparableFilename(filename);
-    if (comparable && !byComparableName.has(comparable)) {
-      byComparableName.set(comparable, record);
-    }
+    byExactName.set(filename.toLowerCase(), record);
   }
 
-  return { byExactName: index, byComparableName };
+  return { byExactName };
 }
 
 function findLocalImageMatch(localImageIndex, ref) {
   const filename = sanitizeAssetFilename(ref);
-  const exact = localImageIndex.byExactName.get(filename.toLowerCase());
 
-  if (exact) {
-    return exact;
-  }
-
-  const comparable = normalizeComparableFilename(filename);
-  return localImageIndex.byComparableName.get(comparable) || null;
+  // Strict production rule:
+  // Only exact filename matches are allowed for /manus-storage/ references.
+  // No fuzzy matching. No backup-image matching. No guessed substitutions.
+  return localImageIndex.byExactName.get(filename.toLowerCase()) || null;
 }
 
 function bufferLooksLikeImage(buffer, ref = "") {
@@ -332,21 +312,17 @@ function bufferLooksLikeImage(buffer, ref = "") {
     return head.startsWith("<svg") || head.includes("<svg");
   }
 
-  // jpg
-  if (buffer[0] === 0xff && buffer[1] === 0xd8) return true;
+  if (buffer[0] === 0xff && buffer[1] === 0xd8) return true; // jpg
 
-  // png
   if (
     buffer[0] === 0x89 &&
     buffer[1] === 0x50 &&
     buffer[2] === 0x4e &&
     buffer[3] === 0x47
-  ) return true;
+  ) return true; // png
 
-  // gif
   if (buffer.toString("ascii", 0, 3) === "GIF") return true;
 
-  // webp
   if (
     buffer.toString("ascii", 0, 4) === "RIFF" &&
     buffer.toString("ascii", 8, 12) === "WEBP"
@@ -422,7 +398,7 @@ async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
     if (localMatch) {
       if (localMatch.alreadyPublic) {
         refToPublicPath.set(ref, localMatch.publicPath);
-        console.log(`Using existing public image for ${ref}: ${localMatch.publicPath}`);
+        console.log(`Using exact public ZIP image for ${ref}: ${localMatch.publicPath}`);
         continue;
       }
 
@@ -442,14 +418,14 @@ async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
           });
 
           existingPaths.add(localPath);
-          console.log(`Copied ZIP-local image ${localMatch.filePath} -> ${localPath}`);
+          console.log(`Copied exact ZIP-local image ${localMatch.filePath} -> ${localPath}`);
         }
 
         refToPublicPath.set(ref, publicPath);
         continue;
       }
 
-      console.log(`Local image match had no usable image bytes for ${ref}: ${localMatch.filePath}`);
+      console.log(`Exact local image match had no usable image bytes for ${ref}: ${localMatch.filePath}`);
     }
 
     const downloaded = await fetchManusAsset({
@@ -488,6 +464,7 @@ async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
         unresolved,
         assetBaseUrl: resolvedAssetBaseUrl,
         assetBaseUrls: resolvedAssetBaseUrls,
+        assetResolutionPolicy: "strict_exact_or_recovered",
       }
     );
   }
@@ -518,6 +495,8 @@ async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
       content: Buffer.from(text, "utf8"),
     };
   });
+
+  console.log("Strict image integrity check passed. No fallback/backup image substitution used.");
 
   return [...normalizedFiles, ...filesToAdd];
 }
@@ -861,6 +840,7 @@ app.post("/process-zip", async (req, res) => {
         deployment_status: "deployed",
         deployed_preview_url: previewUrl,
         cloudflare_project_name: pagesProject.name,
+        asset_resolution_policy: "strict_exact_or_recovered",
       });
 
       console.log("WP updated: pushed and deployed");
@@ -891,8 +871,7 @@ app.post("/process-zip", async (req, res) => {
         await updateWebsiteOrder(website_order_id, {
           github_push_status: isAssetError ? "blocked" : "failed",
           deployment_status: deploymentStatus,
-          // Keep order_status within the allowed ACF select values.
-          // "failed" is not always registered as an allowed order_status.
+          // Keep order_status within allowed ACF select values and avoid false "complete" states.
           order_status: "needs_attention",
           deployment_error: err?.message || String(err),
         });
@@ -917,6 +896,7 @@ app.post("/process-zip", async (req, res) => {
       error: message,
       unresolved_assets: isAssetError ? err.details?.unresolved || [] : undefined,
       asset_base_url_used: isAssetError ? err.details?.assetBaseUrl || "" : undefined,
+      asset_resolution_policy: "strict_exact_or_recovered",
     });
   }
 });
