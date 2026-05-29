@@ -1,8 +1,9 @@
 import express from "express";
 import fetch from "node-fetch";
 import AdmZip from "adm-zip";
+import crypto from "node:crypto";
 
-console.log("ZIP PROCESSOR BUILD v7 - strict Manus image integrity");
+console.log("ZIP PROCESSOR BUILD v8 - strict Manus image integrity + CDN localization");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -218,6 +219,202 @@ function getAllManusStorageRefs(files) {
   }
 
   return [...refs];
+}
+
+function getExternalManusCdnImageRefsFromText(text) {
+  const refs = new Set();
+
+  // Scope this rewrite to Manus CDN images only. Normal stable public URLs
+  // stay untouched unless they come from the Manus artifact layer.
+  const regex =
+    /https:\/\/files\.manuscdn\.com\/[^"'`\s)\\]+?\.(jpg|jpeg|png|webp|gif|svg)(\?[^"'`\s)\\]*)?/gi;
+
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    refs.add(match[0]);
+  }
+
+  return [...refs];
+}
+
+function getAllExternalManusCdnImageRefs(files) {
+  const refs = new Set();
+
+  for (const file of files) {
+    if (!isTextFileForImageRewrite(file.filePath)) continue;
+
+    const content = getFileContent(file);
+    if (!content) continue;
+
+    const text = content.toString("utf8");
+    for (const ref of getExternalManusCdnImageRefsFromText(text)) {
+      refs.add(ref);
+    }
+  }
+
+  return [...refs];
+}
+
+function shortHash(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex").slice(0, 10);
+}
+
+function filenameFromUrl(urlValue, fallbackPrefix = "manus-image") {
+  try {
+    const parsed = new URL(urlValue);
+    const lastSegment = parsed.pathname.split("/").filter(Boolean).pop() || "";
+    const clean = sanitizeAssetFilename(lastSegment);
+
+    if (clean && isImageFile(clean)) {
+      return clean;
+    }
+  } catch {
+    // Fall through to fallback below.
+  }
+
+  return `${fallbackPrefix}-${shortHash(urlValue)}.jpg`;
+}
+
+function makeUniquePublicImagePath({ filename, existingPaths, sourceId }) {
+  const extMatch = filename.match(/(\.[a-z0-9]+)$/i);
+  const ext = extMatch ? extMatch[1] : ".jpg";
+  const base = filename.replace(new RegExp(`${ext.replace(".", "\\.")}$`, "i"), "");
+  let localPath = `client/public/images/${filename}`;
+
+  if (!existingPaths.has(localPath)) {
+    return {
+      localPath,
+      publicPath: `/images/${filename}`,
+    };
+  }
+
+  const hashedFilename = `${base}-${shortHash(sourceId)}${ext}`;
+  localPath = `client/public/images/${hashedFilename}`;
+
+  return {
+    localPath,
+    publicPath: `/images/${hashedFilename}`,
+  };
+}
+
+async function fetchExternalImageUrl(imageUrl) {
+  console.log("Attempting external Manus CDN image download:", imageUrl);
+
+  const res = await fetch(imageUrl, {
+    headers: {
+      Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+      "User-Agent": "obd-zip-processor",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`External Manus CDN image download failed: ${res.status} ${imageUrl}`);
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+  const buffer = Buffer.from(await res.arrayBuffer());
+
+  if (!contentType.startsWith("image/") && !bufferLooksLikeImage(buffer, imageUrl)) {
+    throw new Error(`External Manus CDN URL did not return an image: ${contentType || "(no content-type)"} ${imageUrl}`);
+  }
+
+  if (!bufferLooksLikeImage(buffer, imageUrl)) {
+    throw new Error(`External Manus CDN image failed signature check: ${imageUrl}`);
+  }
+
+  return buffer;
+}
+
+async function normalizeExternalManusCdnImageAssets({ files }) {
+  const refs = getAllExternalManusCdnImageRefs(files);
+
+  if (!refs.length) {
+    console.log("No external Manus CDN image URLs found");
+    return files;
+  }
+
+  console.log("Found external Manus CDN image URLs:", refs);
+
+  const existingPaths = new Set(files.map((f) => f.filePath));
+  const filesToAdd = [];
+  const refToPublicPath = new Map();
+  const unresolved = [];
+
+  for (const ref of refs) {
+    try {
+      const downloaded = await fetchExternalImageUrl(ref);
+      const originalFilename = filenameFromUrl(ref, "manus-cdn-image");
+      const extMatch = originalFilename.match(/(\.[a-z0-9]+)$/i);
+      const ext = extMatch ? extMatch[1] : ".jpg";
+      const base = originalFilename.replace(new RegExp(`${ext.replace(".", "\\.")}$`, "i"), "");
+      const filename = `${base}-${shortHash(ref)}${ext}`;
+
+      const { localPath, publicPath } = makeUniquePublicImagePath({
+        filename,
+        existingPaths,
+        sourceId: ref,
+      });
+
+      if (!existingPaths.has(localPath)) {
+        filesToAdd.push({
+          entry: null,
+          filePath: localPath,
+          content: downloaded,
+          generated: true,
+          copiedFrom: ref,
+        });
+
+        existingPaths.add(localPath);
+      }
+
+      refToPublicPath.set(ref, publicPath);
+      console.log(`Localized external Manus CDN image ${ref} -> ${localPath}`);
+    } catch (err) {
+      console.log("External Manus CDN image localization failed:", err?.message || String(err));
+      unresolved.push(ref);
+    }
+  }
+
+  if (unresolved.length) {
+    throw new AssetResolutionError(
+      `Unresolved external Manus CDN image assets. Refusing to deploy remote/ephemeral images: ${unresolved.join(", ")}`,
+      {
+        unresolved,
+        assetResolutionPolicy: "strict_exact_recovered_or_cdn_localized",
+      }
+    );
+  }
+
+  const normalizedFiles = files.map((file) => {
+    if (!isTextFileForImageRewrite(file.filePath)) {
+      return file;
+    }
+
+    const originalContent = getFileContent(file);
+    if (!originalContent) return file;
+
+    let text = originalContent.toString("utf8");
+    let changed = false;
+
+    for (const [ref, publicPath] of refToPublicPath.entries()) {
+      if (text.includes(ref)) {
+        text = text.split(ref).join(publicPath);
+        changed = true;
+        console.log(`Rewrote external Manus CDN image in ${file.filePath}: ${ref} -> ${publicPath}`);
+      }
+    }
+
+    if (!changed) return file;
+
+    return {
+      ...file,
+      content: Buffer.from(text, "utf8"),
+    };
+  });
+
+  console.log("External Manus CDN image localization complete.");
+
+  return [...normalizedFiles, ...filesToAdd];
 }
 
 function deriveAssetBaseUrl({ zipUrl, assetBaseUrl }) {
@@ -788,6 +985,10 @@ app.post("/process-zip", async (req, res) => {
       assetBaseUrl: asset_base_url,
     });
 
+    files = await normalizeExternalManusCdnImageAssets({
+      files,
+    });
+
     await ensureGitHubRepo(repo_name);
 
     console.log(`Uploading ${files.length} files to GitHub repo: ${repo_name}`);
@@ -840,7 +1041,7 @@ app.post("/process-zip", async (req, res) => {
         deployment_status: "deployed",
         deployed_preview_url: previewUrl,
         cloudflare_project_name: pagesProject.name,
-        asset_resolution_policy: "strict_exact_or_recovered",
+        asset_resolution_policy: "strict_exact_recovered_or_cdn_localized",
       });
 
       console.log("WP updated: pushed and deployed");
@@ -896,7 +1097,7 @@ app.post("/process-zip", async (req, res) => {
       error: message,
       unresolved_assets: isAssetError ? err.details?.unresolved || [] : undefined,
       asset_base_url_used: isAssetError ? err.details?.assetBaseUrl || "" : undefined,
-      asset_resolution_policy: "strict_exact_or_recovered",
+      asset_resolution_policy: "strict_exact_recovered_or_cdn_localized",
     });
   }
 });
