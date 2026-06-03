@@ -3,7 +3,7 @@ import fetch from "node-fetch";
 import AdmZip from "adm-zip";
 import crypto from "node:crypto";
 
-console.log("ZIP PROCESSOR BUILD v8 - strict Manus image integrity + CDN localization");
+console.log("ZIP PROCESSOR BUILD v9 - strict image integrity + external CDN localization");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -209,7 +209,7 @@ function getAllManusStorageRefs(files) {
   for (const file of files) {
     if (!isTextFileForImageRewrite(file.filePath)) continue;
 
-    const content = getFileContent(file);
+    const content = file.content || file.entry?.getData();
     if (!content) continue;
 
     const text = content.toString("utf8");
@@ -221,23 +221,42 @@ function getAllManusStorageRefs(files) {
   return [...refs];
 }
 
-function getExternalManusCdnImageRefsFromText(text) {
-  const refs = new Set();
 
-  // Scope this rewrite to Manus CDN images only. Normal stable public URLs
-  // stay untouched unless they come from the Manus artifact layer.
-  const regex =
-    /https:\/\/files\.manuscdn\.com\/[^"'`\s)\\]+?\.(jpg|jpeg|png|webp|gif|svg)(\?[^"'`\s)\\]*)?/gi;
+function shortHash(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex").slice(0, 10);
+}
+
+function isRecoverableExternalImageUrl(urlValue) {
+  try {
+    const parsed = new URL(urlValue);
+    const hostname = parsed.hostname.toLowerCase();
+
+    return (
+      hostname === "files.manuscdn.com" ||
+      hostname.endsWith(".manuscdn.com") ||
+      hostname.endsWith(".cloudfront.net")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function getExternalGeneratedImageRefsFromText(text) {
+  const refs = new Set();
+  const regex = /https:\/\/[^"'`\s)\\]+?\.(jpg|jpeg|png|webp|gif|svg)(\?[^"'`\s)\\]*)?/gi;
 
   let match;
   while ((match = regex.exec(text)) !== null) {
-    refs.add(match[0]);
+    const ref = match[0];
+    if (isRecoverableExternalImageUrl(ref)) {
+      refs.add(ref);
+    }
   }
 
   return [...refs];
 }
 
-function getAllExternalManusCdnImageRefs(files) {
+function getAllExternalGeneratedImageRefs(files) {
   const refs = new Set();
 
   for (const file of files) {
@@ -247,7 +266,7 @@ function getAllExternalManusCdnImageRefs(files) {
     if (!content) continue;
 
     const text = content.toString("utf8");
-    for (const ref of getExternalManusCdnImageRefsFromText(text)) {
+    for (const ref of getExternalGeneratedImageRefsFromText(text)) {
       refs.add(ref);
     }
   }
@@ -255,11 +274,7 @@ function getAllExternalManusCdnImageRefs(files) {
   return [...refs];
 }
 
-function shortHash(value) {
-  return crypto.createHash("sha256").update(String(value || "")).digest("hex").slice(0, 10);
-}
-
-function filenameFromUrl(urlValue, fallbackPrefix = "manus-image") {
+function filenameFromUrl(urlValue, fallbackPrefix = "external-generated-image") {
   try {
     const parsed = new URL(urlValue);
     const lastSegment = parsed.pathname.split("/").filter(Boolean).pop() || "";
@@ -278,7 +293,8 @@ function filenameFromUrl(urlValue, fallbackPrefix = "manus-image") {
 function makeUniquePublicImagePath({ filename, existingPaths, sourceId }) {
   const extMatch = filename.match(/(\.[a-z0-9]+)$/i);
   const ext = extMatch ? extMatch[1] : ".jpg";
-  const base = filename.replace(new RegExp(`${ext.replace(".", "\\.")}$`, "i"), "");
+  const escapedExt = ext.replace(".", "\\.");
+  const base = filename.replace(new RegExp(`${escapedExt}$`, "i"), "");
   let localPath = `client/public/images/${filename}`;
 
   if (!existingPaths.has(localPath)) {
@@ -297,8 +313,8 @@ function makeUniquePublicImagePath({ filename, existingPaths, sourceId }) {
   };
 }
 
-async function fetchExternalImageUrl(imageUrl) {
-  console.log("Attempting external Manus CDN image download:", imageUrl);
+async function fetchExternalGeneratedImage(imageUrl) {
+  console.log("Attempting external generated image download:", imageUrl);
 
   const res = await fetch(imageUrl, {
     headers: {
@@ -308,32 +324,34 @@ async function fetchExternalImageUrl(imageUrl) {
   });
 
   if (!res.ok) {
-    throw new Error(`External Manus CDN image download failed: ${res.status} ${imageUrl}`);
+    throw new Error(`External generated image download failed: ${res.status} ${imageUrl}`);
   }
 
   const contentType = res.headers.get("content-type") || "";
   const buffer = Buffer.from(await res.arrayBuffer());
 
   if (!contentType.startsWith("image/") && !bufferLooksLikeImage(buffer, imageUrl)) {
-    throw new Error(`External Manus CDN URL did not return an image: ${contentType || "(no content-type)"} ${imageUrl}`);
+    throw new Error(
+      `External generated image URL did not return an image: ${contentType || "(no content-type)"} ${imageUrl}`
+    );
   }
 
   if (!bufferLooksLikeImage(buffer, imageUrl)) {
-    throw new Error(`External Manus CDN image failed signature check: ${imageUrl}`);
+    throw new Error(`External generated image failed signature check: ${imageUrl}`);
   }
 
   return buffer;
 }
 
-async function normalizeExternalManusCdnImageAssets({ files }) {
-  const refs = getAllExternalManusCdnImageRefs(files);
+async function normalizeExternalGeneratedImageAssets({ files }) {
+  const refs = getAllExternalGeneratedImageRefs(files);
 
   if (!refs.length) {
-    console.log("No external Manus CDN image URLs found");
+    console.log("No external generated image URLs found");
     return files;
   }
 
-  console.log("Found external Manus CDN image URLs:", refs);
+  console.log("Found external generated image URLs:", refs);
 
   const existingPaths = new Set(files.map((f) => f.filePath));
   const filesToAdd = [];
@@ -342,11 +360,12 @@ async function normalizeExternalManusCdnImageAssets({ files }) {
 
   for (const ref of refs) {
     try {
-      const downloaded = await fetchExternalImageUrl(ref);
-      const originalFilename = filenameFromUrl(ref, "manus-cdn-image");
+      const downloaded = await fetchExternalGeneratedImage(ref);
+      const originalFilename = filenameFromUrl(ref, "external-generated-image");
       const extMatch = originalFilename.match(/(\.[a-z0-9]+)$/i);
       const ext = extMatch ? extMatch[1] : ".jpg";
-      const base = originalFilename.replace(new RegExp(`${ext.replace(".", "\\.")}$`, "i"), "");
+      const escapedExt = ext.replace(".", "\\.");
+      const base = originalFilename.replace(new RegExp(`${escapedExt}$`, "i"), "");
       const filename = `${base}-${shortHash(ref)}${ext}`;
 
       const { localPath, publicPath } = makeUniquePublicImagePath({
@@ -368,19 +387,19 @@ async function normalizeExternalManusCdnImageAssets({ files }) {
       }
 
       refToPublicPath.set(ref, publicPath);
-      console.log(`Localized external Manus CDN image ${ref} -> ${localPath}`);
+      console.log(`Localized external generated image ${ref} -> ${localPath}`);
     } catch (err) {
-      console.log("External Manus CDN image localization failed:", err?.message || String(err));
+      console.log("External generated image localization failed:", err?.message || String(err));
       unresolved.push(ref);
     }
   }
 
   if (unresolved.length) {
     throw new AssetResolutionError(
-      `Unresolved external Manus CDN image assets. Refusing to deploy remote/ephemeral images: ${unresolved.join(", ")}`,
+      `Unresolved external generated image assets. Refusing to deploy remote/ephemeral images: ${unresolved.join(", ")}`,
       {
         unresolved,
-        assetResolutionPolicy: "strict_exact_recovered_or_cdn_localized",
+        assetResolutionPolicy: "strict_exact_recovered_or_external_localized",
       }
     );
   }
@@ -400,7 +419,7 @@ async function normalizeExternalManusCdnImageAssets({ files }) {
       if (text.includes(ref)) {
         text = text.split(ref).join(publicPath);
         changed = true;
-        console.log(`Rewrote external Manus CDN image in ${file.filePath}: ${ref} -> ${publicPath}`);
+        console.log(`Rewrote external generated image in ${file.filePath}: ${ref} -> ${publicPath}`);
       }
     }
 
@@ -412,9 +431,26 @@ async function normalizeExternalManusCdnImageAssets({ files }) {
     };
   });
 
-  console.log("External Manus CDN image localization complete.");
+  console.log("External generated image localization complete.");
 
   return [...normalizedFiles, ...filesToAdd];
+}
+
+function assertNoRecoverableExternalImageRefsRemain(files) {
+  const remaining = getAllExternalGeneratedImageRefs(files);
+
+  if (!remaining.length) {
+    console.log("No recoverable external generated image URLs remain after localization.");
+    return;
+  }
+
+  throw new AssetResolutionError(
+    `External generated image URLs remain after localization. Refusing non-self-contained deploy: ${remaining.join(", ")}`,
+    {
+      unresolved: remaining,
+      assetResolutionPolicy: "strict_exact_recovered_or_external_localized",
+    }
+  );
 }
 
 function deriveAssetBaseUrl({ zipUrl, assetBaseUrl }) {
@@ -453,7 +489,9 @@ function deriveAssetBaseUrls({ zipUrl, assetBaseUrl }) {
     console.log("Could not derive asset base URL from ZIP URL:", err.message);
   }
 
-  // Last-resort probe. If Manus returns HTML/404, image signature checks below block it.
+  // Manus sometimes returns relative /manus-storage paths that are only useful
+  // from a Manus host. This candidate usually returns 404 for publish-only paths,
+  // but it is harmless to try before blocking the deploy.
   addCandidate("https://manus.im");
 
   return candidates;
@@ -466,8 +504,18 @@ function getFileContent(file) {
   return null;
 }
 
+function normalizeComparableFilename(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\.(jpg|jpeg|png|webp|gif|svg)$/i, "")
+    .replace(/[_-]?[a-f0-9]{6,12}$/i, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 function createLocalImageIndex(files) {
-  const byExactName = new Map();
+  const index = new Map();
+  const byComparableName = new Map();
 
   for (const filePath of getAllImageFilePaths(files)) {
     const filename = filePath.split("/").pop();
@@ -484,19 +532,27 @@ function createLocalImageIndex(files) {
       publicPath: alreadyPublic ? getPublicImagePathForLocalFile(filePath) : `/images/${sanitizeAssetFilename(filename)}`,
     };
 
-    byExactName.set(filename.toLowerCase(), record);
+    index.set(filename.toLowerCase(), record);
+
+    const comparable = normalizeComparableFilename(filename);
+    if (comparable && !byComparableName.has(comparable)) {
+      byComparableName.set(comparable, record);
+    }
   }
 
-  return { byExactName };
+  return { byExactName: index, byComparableName };
 }
 
 function findLocalImageMatch(localImageIndex, ref) {
   const filename = sanitizeAssetFilename(ref);
+  const exact = localImageIndex.byExactName.get(filename.toLowerCase());
 
-  // Strict production rule:
-  // Only exact filename matches are allowed for /manus-storage/ references.
-  // No fuzzy matching. No backup-image matching. No guessed substitutions.
-  return localImageIndex.byExactName.get(filename.toLowerCase()) || null;
+  if (exact) {
+    return exact;
+  }
+
+  const comparable = normalizeComparableFilename(filename);
+  return localImageIndex.byComparableName.get(comparable) || null;
 }
 
 function bufferLooksLikeImage(buffer, ref = "") {
@@ -509,17 +565,21 @@ function bufferLooksLikeImage(buffer, ref = "") {
     return head.startsWith("<svg") || head.includes("<svg");
   }
 
-  if (buffer[0] === 0xff && buffer[1] === 0xd8) return true; // jpg
+  // jpg
+  if (buffer[0] === 0xff && buffer[1] === 0xd8) return true;
 
+  // png
   if (
     buffer[0] === 0x89 &&
     buffer[1] === 0x50 &&
     buffer[2] === 0x4e &&
     buffer[3] === 0x47
-  ) return true; // png
+  ) return true;
 
+  // gif
   if (buffer.toString("ascii", 0, 3) === "GIF") return true;
 
+  // webp
   if (
     buffer.toString("ascii", 0, 4) === "RIFF" &&
     buffer.toString("ascii", 8, 12) === "WEBP"
@@ -595,7 +655,7 @@ async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
     if (localMatch) {
       if (localMatch.alreadyPublic) {
         refToPublicPath.set(ref, localMatch.publicPath);
-        console.log(`Using exact public ZIP image for ${ref}: ${localMatch.publicPath}`);
+        console.log(`Using existing public image for ${ref}: ${localMatch.publicPath}`);
         continue;
       }
 
@@ -615,14 +675,14 @@ async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
           });
 
           existingPaths.add(localPath);
-          console.log(`Copied exact ZIP-local image ${localMatch.filePath} -> ${localPath}`);
+          console.log(`Copied ZIP-local image ${localMatch.filePath} -> ${localPath}`);
         }
 
         refToPublicPath.set(ref, publicPath);
         continue;
       }
 
-      console.log(`Exact local image match had no usable image bytes for ${ref}: ${localMatch.filePath}`);
+      console.log(`Local image match had no usable image bytes for ${ref}: ${localMatch.filePath}`);
     }
 
     const downloaded = await fetchManusAsset({
@@ -661,7 +721,6 @@ async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
         unresolved,
         assetBaseUrl: resolvedAssetBaseUrl,
         assetBaseUrls: resolvedAssetBaseUrls,
-        assetResolutionPolicy: "strict_exact_or_recovered",
       }
     );
   }
@@ -692,8 +751,6 @@ async function normalizeManusImageAssets({ files, zipUrl, assetBaseUrl }) {
       content: Buffer.from(text, "utf8"),
     };
   });
-
-  console.log("Strict image integrity check passed. No fallback/backup image substitution used.");
 
   return [...normalizedFiles, ...filesToAdd];
 }
@@ -985,9 +1042,11 @@ app.post("/process-zip", async (req, res) => {
       assetBaseUrl: asset_base_url,
     });
 
-    files = await normalizeExternalManusCdnImageAssets({
+    files = await normalizeExternalGeneratedImageAssets({
       files,
     });
+
+    assertNoRecoverableExternalImageRefsRemain(files);
 
     await ensureGitHubRepo(repo_name);
 
@@ -1041,7 +1100,6 @@ app.post("/process-zip", async (req, res) => {
         deployment_status: "deployed",
         deployed_preview_url: previewUrl,
         cloudflare_project_name: pagesProject.name,
-        asset_resolution_policy: "strict_exact_recovered_or_cdn_localized",
       });
 
       console.log("WP updated: pushed and deployed");
@@ -1072,7 +1130,8 @@ app.post("/process-zip", async (req, res) => {
         await updateWebsiteOrder(website_order_id, {
           github_push_status: isAssetError ? "blocked" : "failed",
           deployment_status: deploymentStatus,
-          // Keep order_status within allowed ACF select values and avoid false "complete" states.
+          // Keep order_status within the allowed ACF select values.
+          // "failed" is not always registered as an allowed order_status.
           order_status: "needs_attention",
           deployment_error: err?.message || String(err),
         });
@@ -1097,7 +1156,6 @@ app.post("/process-zip", async (req, res) => {
       error: message,
       unresolved_assets: isAssetError ? err.details?.unresolved || [] : undefined,
       asset_base_url_used: isAssetError ? err.details?.assetBaseUrl || "" : undefined,
-      asset_resolution_policy: "strict_exact_recovered_or_cdn_localized",
     });
   }
 });
